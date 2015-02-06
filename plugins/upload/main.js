@@ -485,6 +485,7 @@ define(function () {
      */
 
     window.plugins.webintent.getUri(function(url) {
+        console.log('URL: '+url);
         if(url) {
             plugin.checkSiteToUploadTo(url);
         }
@@ -494,8 +495,10 @@ define(function () {
         function(has) {
             // has is true iff it has the extra
             if (has) {
+                console.log('has 1');
                 window.plugins.webintent.getExtra(window.plugins.webintent.EXTRA_STREAM,
                     function(url) {
+                        console.log('URL a 1: '+url);
                         if(url && url !== "") {
                             plugin.checkSiteToUploadTo(url);
                         }
@@ -514,8 +517,10 @@ define(function () {
         function(has) {
             // has is true iff it has the extra
             if (has) {
+                console.log('has 2');
                 window.plugins.webintent.getExtra(window.plugins.webintent.EXTRA_TEXT,
                     function(text) {
+                        console.log('text: '+text);
                         if(text && text !== "") {
                             plugin.askForFilename(text);
                         }
