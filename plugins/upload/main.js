@@ -23,6 +23,11 @@ define(function () {
             ["upload/video", "upload_video", "uploadVideo"]
         ],
 
+        storage: {
+            sharedfile: {type: "model"},
+            sharedfiles: {type: "collection", model: "sharedfile"}
+        },
+
         /**
          * Determines is the plugin is visible.
          * It may check Moodle remote site version, device OS, device type, etc...
@@ -186,6 +191,283 @@ define(function () {
             if (error.code != CaptureError.CAPTURE_NO_MEDIA_FILES) {
                 MM.popErrorMessage(MM.lang.s("errorcapturingvideo"));
             }
+        },
+
+        /**
+         * Checks if there is a file to be uploaded in iOS. If there is, starts the upload process.
+         * It also deletes files shared previously but not sent.
+         */
+        checkIOSNewFiles: function() {
+            MM.fs.getDirectoryContents('Inbox', function(entries) {
+
+                if(entries.length > 0) {
+
+                    var entryToSend = undefined;
+                    var treated = 0, total = entries.length;
+                    $.each(entries, function(index, entry) {
+                        var stored = MM.db.get('sharedfiles', hex_md5( MM.fs.entryURL(entry) ));
+                        if(stored) {
+                            // File was shared previously but not sent. Delete the file and its LocalStorage entries.
+                            MM.log('Found file '+entry.name+' left in Inbox. It will be deleted.', 'Upload');
+                            entry.remove();
+                            stored.destroy();
+                        } else {
+                            // File wasn't shared previously. Try to send it now.
+                            MM.log('Found file '+entry.name+' ready to be sent.', 'Upload');
+                            entryToSend = entry;
+                        }
+                    });
+
+                    if(typeof(entryToSend) != 'undefined') {
+                        var fileURL = MM.fs.entryURL(entryToSend);
+                        var model = {
+                            id: hex_md5(fileURL),
+                            name: entryToSend.name // We store the name just for debugging purposes.
+                        };
+                        MM.db.insert('sharedfiles', model);
+
+                        plugin.checkSiteToUploadTo(fileURL, true);
+                    }
+                }
+            }, function() {
+                // Folder doesn't exist.
+            });
+        },
+
+        /**
+         * Upload text process (Android).
+         * Asks the user for a file name and creates a file with the shared text to be uploaded afterwards.
+         *
+         * @param {String} text Shared text.
+         */
+        askForFilename: function(text) {
+
+            var tpl = MM.tpl.render($('#input-filename_template').html(), {}); // Tpl with a text input.
+
+            var options = {
+                autoclose: 0,
+                buttons: {},
+                title: MM.lang.s('upload')
+            };
+
+            options.buttons[MM.lang.s('ok')] = function() {
+                var filename = $.trim( $('#filenameinput').val() );
+
+                if (!filename) {
+                    $('#filenameerror').show().html( MM.lang.s('filenamerequired') );
+                    return;
+                }
+
+                MM.log('Create a file with the shared text with name '+filename, 'Upload');
+
+                // Create the file in a tmp folder
+                MM.fs.getFileAndWriteInIt('tmp/' + filename + '.txt', text,
+                    function(fileURL) {
+                        MM.log('File '+filename+' has been created', 'Upload');
+                        plugin.checkSiteToUploadTo(fileURL, true);
+                    }, function() {
+                        MM.log('An error occurred while creating the file '+filename, 'Upload');
+                        MM.popErrorMessage( MM.lang.s('errorcreatetoupload') );
+                    }
+                );
+
+            };
+
+            if (navigator.app && navigator.app.exitApp) {
+                options.buttons[MM.lang.s('cancel')] = navigator.app.exitApp;
+            } else {
+                options.buttons[MM.lang.s('cancel')] = MM.widgets.dialogClose;
+            }
+
+            MM.popMessage(tpl, options);
+        },
+
+        /**
+         * Check to which site should a file be uploaded to.
+         *
+         * @param {String} fileURL                  File's full path.
+         * @param {Boolean} deleteFileAfterUpload   True if the file should be deleted after being uploaded.
+         */
+        checkSiteToUploadTo: function(fileURL, deleteFileAfterUpload){
+
+            // Wait for lang to be initialized
+            if( MM.lang.current == '' ){
+                MM.log("Current lang hasn't been initialized yet.", 'Upload');
+                setTimeout(function() {
+                    plugin.checkSiteToUploadTo(fileURL, deleteFileAfterUpload);
+                }, 50);
+                return;
+            }
+
+            MM.log('Check site to upload to. File URL: ' + fileURL, 'Upload');
+
+            var sites = [];
+            MM.db.each('sites', function(el) {
+                sites.push(el.toJSON());
+            });
+
+            if( sites.length == 0 ) {
+                MM.log('There are no sites to upload the file to.', 'Upload');
+                MM.popErrorMessage( MM.lang.s("errorreceivefilenosites") );
+                if(deleteFileAfterUpload) {
+                    plugin.deleteFile(fileURL);
+                }
+            }
+            else if( sites.length == 1 ) {
+                MM.log('There is ONE site registered to upload the file to.', 'Upload');
+                // Confirm that the user wants to upload the file to this site.
+                MM.popConfirm( MM.lang.s("confirmuploadfile", "core", sites[0].sitename),
+                    function() {
+                        MM.log('User confirmed. Send the file.', 'Upload');
+                        if( ! MM.config.current_site ){
+                            // Lets authenticate the user
+                            MM.site = MM.db.get('sites', sites[0].site);
+                            MM.setUpConfig();
+                        }
+                        plugin.uploadFileToSite( fileURL, deleteFileAfterUpload );
+                    },
+                    function() {
+                        MM.log('User cancelled.', 'Upload');
+                        if(deleteFileAfterUpload) {
+                            plugin.deleteFile(fileURL);
+                        }
+
+                        if (navigator.app && navigator.app.exitApp) {
+                            navigator.app.exitApp();
+                        }
+                    }
+                );
+            }
+            else {
+                MM.log('There is several sites registered to upload the file to.', 'Upload');
+
+                // Render all sites so the user can choose which one he wants to upload the file to.
+                var tpl = MM.tpl.render($('#choose-account-upload_template').html(),
+                        {sites: sites, fileURI: fileURL, deleteFileAfterUpload: deleteFileAfterUpload});
+                $("#app-dialog").addClass('full-screen-dialog');
+                MM.popMessage(tpl, {autoclose: 0, buttons: []});
+
+                // We handle the clicks using jquery instead of onclick to prevent having to propagate
+                // fileURL and deleteFileAfterUpload.
+
+                $('#app-dialog .account-details').on('click', function(e) {
+                    e.preventDefault();
+
+                    // Set chosen site as current site.
+                    var siteid = $(this).data('siteid');
+                    MM.site = MM.db.get('sites', siteid);
+                    MM.setUpConfig();
+                    MM.log('User chose the site '+siteid, 'Upload');
+
+                    plugin.uploadFileToSite(fileURL, deleteFileAfterUpload);
+                });
+
+                $('#btn-cancel-upload').on('click', function(e) {
+                    e.preventDefault();
+                    MM.log('User cancelled.', 'Upload');
+
+                    if(deleteFileAfterUpload) {
+                        plugin.deleteFile(fileURL);
+                    }
+
+                    if (navigator.app && navigator.app.exitApp) {
+                        navigator.app.exitApp();
+                    } else {
+                        MM.widgets.dialogClose();
+                        $("#app-dialog").removeClass('full-screen-dialog');
+                    }
+                });
+
+            }
+        },
+
+        /**
+         * Retrieves and deletes a file.
+         * @param  {String} fileURL Path of the file to delete.
+         */
+        deleteFile: function(fileURL) {
+            MM.fs.getExternalFile(fileURL, function(fileEntry) {
+                fileEntry.remove();
+
+                if(MM.getOS() == 'ios') {
+                    var stored = MM.db.get('sharedfiles', hex_md5( fileURL ));
+                    if(stored) {
+                        stored.destroy();
+                    }
+                }
+            }, function(error) {
+                MM.log("File not deleted because it wasn't found", 'Upload');
+            });
+        },
+
+        /**
+         * Upload the file to the current site.
+         *
+         * @param {String} fileURL                  File's full path.
+         * @param {Boolean} deleteFileAfterUpload   True if the file should be deleted after being uploaded.
+         */
+        uploadFileToSite: function(fileURL, deleteFileAfterUpload) {
+
+            MM.fs.getExternalFile(fileURL, function(fileEntry) {
+                MM.log('File to upload retrieved. Name: '+fileEntry.name, 'Upload');
+                var path = MM.fs.entryURL(fileEntry);
+                var filename = MM.util.addDateToFilename( path.substr(path.lastIndexOf("/") + 1) );
+
+                var options = {};
+                options.fileKey = null;
+                options.fileName = filename;
+                options.mimeType = null;
+                MM.moodleUploadFile(path, options,
+                    function(){
+                        // File uploaded. Show a popup with a close button to close the app.
+                        MM.log('File successfully uploaded.', 'Upload');
+
+                        if(deleteFileAfterUpload) {
+                            fileEntry.remove();
+
+                            if(MM.getOS() == 'ios') {
+                                var stored = MM.db.get('sharedfiles', hex_md5( fileURL ));
+                                if(stored) {
+                                    stored.destroy();
+                                }
+                            }
+                        }
+
+                        var options = {
+                            buttons: {}
+                        };
+                        options.buttons[MM.lang.s('close')] = function() {
+                            if (navigator.app && navigator.app.exitApp) {
+                                navigator.app.exitApp();
+                            } else {
+                                MM.widgets.dialogClose();
+                                $("#app-dialog").removeClass('full-screen-dialog');
+                            }
+                        };
+                        MM.popMessage(MM.lang.s('fileuploadedwithname', 'core', filename), options);
+                    },
+                    function(){
+                        MM.log('Error uploading file.', 'Upload');
+                        MM.popErrorMessage(MM.lang.s("erroruploading"));
+                    }
+                );
+
+            }, function(error) {
+                MM.log('Error getting external file', 'Upload');
+            });
+        },
+
+        /**
+         * Delete all the tmp files in Android.
+         */
+        deleteAndroidTmpFiles: function() {
+            MM.fs.getDirectoryContents('tmp', function(entries) {
+                $.each(entries, function(index, entry) {
+                    entry.remove();
+                });
+            }, function() {
+                // Folder doesn't exist.
+            });
         }
     }
 
@@ -195,5 +477,69 @@ define(function () {
     }
 
     MM.registerPlugin(plugin);
+
+    /**
+     * Receive files in Android.
+     * getUri is used for files opened directly with the app.
+     * getExtra is used for files shared with the app.
+     */
+
+    window.plugins.webintent.getUri(function(url) {
+        if(url) {
+            plugin.checkSiteToUploadTo(url);
+        }
+    });
+
+    window.plugins.webintent.hasExtra(window.plugins.webintent.EXTRA_STREAM,
+        function(has) {
+            // has is true iff it has the extra
+            if (has) {
+                window.plugins.webintent.getExtra(window.plugins.webintent.EXTRA_STREAM,
+                    function(url) {
+                        if(url && url !== "") {
+                            plugin.checkSiteToUploadTo(url);
+                        }
+                    }, function() {
+                        // There was no extra supplied.
+                    }
+                );
+
+            }
+        }, function() {
+            // Something really bad happened.
+        }
+    );
+
+    window.plugins.webintent.hasExtra(window.plugins.webintent.EXTRA_TEXT,
+        function(has) {
+            // has is true iff it has the extra
+            if (has) {
+                window.plugins.webintent.getExtra(window.plugins.webintent.EXTRA_TEXT,
+                    function(text) {
+                        if(text && text !== "") {
+                            plugin.askForFilename(text);
+                        }
+                    }, function() {
+                        // There was no extra supplied.
+                    }
+                );
+
+            }
+        }, function() {
+            // Something really bad happened.
+        }
+    );
+
+    if(MM.getOS() == 'ios') {
+        /**
+         * Receive files in iOS.
+         */
+        document.addEventListener("resume", plugin.checkIOSNewFiles, false);
+        plugin.checkIOSNewFiles();
+    } else if(MM.getOS() == 'android') {
+        // If the user kills the app after creating a file to share text but before sending it,
+        // the file will be left there forever. Let's clean the tmp files.
+        plugin.deleteAndroidTmpFiles();
+    }
 
 });
